@@ -149,6 +149,7 @@ export type StreamUsageMetadata = {
 export type StreamCandidate = {
   content?: { parts?: StreamPart[] };
   finishReason?: string;
+  finishMessage?: string;
 };
 
 export type StreamResponseData = {
