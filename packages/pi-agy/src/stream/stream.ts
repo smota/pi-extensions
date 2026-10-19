@@ -69,7 +69,8 @@ export { ANTIGRAVITY_API };
 
 const ANTIGRAVITY_SYSTEM_INSTRUCTION =
   "You are Antigravity, a powerful agentic AI coding assistant designed by Google DeepMind. " +
-  "You are pair programming with a user to solve coding tasks. Be concise, practical, and tool-aware.";
+  "You are pair programming with a user to solve coding tasks. Be concise, practical, and tool-aware. " +
+  "IMPORTANT: To execute shell commands, you MUST use the declared 'bash' tool with the 'command' argument. Never call undeclared tools like 'google:exec' or 'exec'.";
 
 const ANTIGRAVITY_NO_PREAMBLE_INSTRUCTION =
   'CRITICAL: NEVER output rule checks, formatting guidelines, constraint checklists (e.g. "No emdashes"), or your thinking/personality preambles in the final response. Output only the final response.';
@@ -80,6 +81,89 @@ function sanitizeToolCallId(id: string, fallbackName?: string): string {
   const cleaned = id.replace(/[^a-zA-Z0-9_-]/g, "_");
   const capped = cleaned.slice(0, 64);
   return capped || `${fallbackName || "tool"}_${Date.now()}_${++toolCallCounter}`;
+}
+
+export function tryRecoverMalformedFunctionCall(
+  finishMessage: string | undefined,
+  availableTools: Tool[] | undefined,
+  thoughtSignature?: string,
+): ToolCall | undefined {
+  if (!finishMessage) return undefined;
+
+  let toolName = "";
+  let argsRaw = "";
+  let bodyFallback = "";
+
+  const matchBrace = finishMessage.match(/call:([a-zA-Z0-9_:-]+)\s*\{([\s\S]*)\}/);
+  if (matchBrace) {
+    toolName = matchBrace[1];
+    argsRaw = matchBrace[2].trim();
+  } else {
+    const matchBlock = finishMessage.match(
+      /call:([a-zA-Z0-9_:-]+)\s*(?:```(?:call:[a-zA-Z0-9_:-]+)?\s*([\s\S]*?)```|([\s\S]+))/i,
+    );
+    if (matchBlock) {
+      toolName = matchBlock[1];
+      bodyFallback = (matchBlock[2] || matchBlock[3] || "").trim();
+    }
+  }
+
+  if (!toolName) return undefined;
+
+  if (!availableTools || availableTools.length === 0) {
+    return undefined;
+  }
+
+  if (
+    (toolName === "google:exec" || toolName === "exec" || toolName === "run_command") &&
+    availableTools.some((t) => t.name === "bash")
+  ) {
+    toolName = "bash";
+  }
+
+  if (!availableTools.some((t) => t.name === toolName)) {
+    const stripped = toolName.replace(/^[a-zA-Z0-9_-]+:/, "");
+    if (availableTools.some((t) => t.name === stripped)) {
+      toolName = stripped;
+    } else {
+      return undefined;
+    }
+  }
+
+  const args: Record<string, unknown> = {};
+  if (argsRaw) {
+    const cmdMatch = argsRaw.match(/(?:^|\b)command:\s*r?("""|'''|"|')([\s\S]*?)\1/);
+    if (cmdMatch) {
+      args.command = cmdMatch[2];
+    } else {
+      try {
+        const parsed: unknown = JSON.parse(`{${argsRaw}}`);
+        if (isRecord(parsed)) {
+          Object.assign(args, parsed);
+        }
+      } catch {
+        const kvRegex = /([a-zA-Z0-9_]+):\s*r?("""|'''|"|')([\s\S]*?)\2/g;
+        let kvMatch: RegExpExecArray | null;
+        while ((kvMatch = kvRegex.exec(argsRaw)) !== null) {
+          args[kvMatch[1]] = kvMatch[3];
+        }
+      }
+    }
+  } else if (bodyFallback) {
+    if (toolName === "bash") {
+      args.command = bodyFallback;
+    } else {
+      args.input = bodyFallback;
+    }
+  }
+
+  return {
+    type: "toolCall",
+    id: sanitizeToolCallId(`recovered-${Date.now()}`, toolName),
+    name: toolName,
+    arguments: args,
+    ...(thoughtSignature ? { thoughtSignature } : {}),
+  };
 }
 
 function toolCallIdNeeded(modelId: string, runtimeModel: string): boolean {
@@ -160,6 +244,16 @@ export function convertMessages(
             parts.push({ text: sanitizeText(block.thinking) });
           }
         } else if (block.type === "toolCall") {
+          const sig =
+            block.thoughtSignature ||
+            (
+              msg.content.find((b: unknown) => isRecord(b) && b.thinkingSignature) as
+                { thinkingSignature?: string } | undefined
+            )?.thinkingSignature ||
+            (
+              msg.content.find((b: unknown) => isRecord(b) && b.textSignature) as
+                { textSignature?: string } | undefined
+            )?.textSignature;
           parts.push({
             functionCall: {
               name: block.name,
@@ -168,7 +262,7 @@ export function convertMessages(
                 ? { id: sanitizeToolCallId(block.id || "", block.name) }
                 : {}),
             },
-            ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
+            ...(sig ? { thoughtSignature: sig } : {}),
           });
         }
       }
@@ -613,6 +707,7 @@ export async function streamResponse(
   response: Response,
   stream: AssistantMessageEventStream,
   output: AssistantMessage,
+  tools?: Tool[],
 ): Promise<boolean> {
   if (!response.body) throw new Error("No response body");
   const reader = response.body.getReader();
@@ -624,6 +719,7 @@ export async function streamResponse(
   let started = false;
   let currentBlock: ActiveBlock | null = null;
   let hasContent = false;
+  let lastThoughtSignature: string | undefined;
   const blocks = output.content;
   const blockIndex = () => blocks.length - 1;
 
@@ -683,9 +779,28 @@ export async function streamResponse(
       const candidate = responseData.candidates?.[0];
 
       for (const part of candidate?.content?.parts || []) {
+        if (part.thoughtSignature) lastThoughtSignature = part.thoughtSignature;
         if (part.text !== undefined) {
-          hasContent = true;
           const isThinking = part.thought === true;
+          if (part.text === "" && !isThinking) {
+            if (part.thoughtSignature) {
+              if (currentBlock && currentBlock.type === "thinking") {
+                currentBlock.thinkingSignature = part.thoughtSignature;
+              } else {
+                const lastThinking = [...blocks]
+                  .reverse()
+                  .find(
+                    (b): b is Extract<ContentBlock, { type: "thinking" }> => b.type === "thinking",
+                  );
+                if (lastThinking) {
+                  lastThinking.thinkingSignature = part.thoughtSignature;
+                }
+              }
+            }
+            continue;
+          }
+
+          hasContent = true;
           const type = isThinking ? "thinking" : "text";
           if (!currentBlock || currentBlock.type !== type) {
             finishCurrent();
@@ -725,10 +840,17 @@ export async function streamResponse(
           hasContent = true;
           finishCurrent();
           const rawId = part.functionCall.id || "";
+          let rawName = part.functionCall.name || "";
+          if (
+            (rawName === "google:exec" || rawName === "exec" || rawName === "run_command") &&
+            tools?.some((t) => t.name === "bash")
+          ) {
+            rawName = "bash";
+          }
           const toolCall: ToolCall = {
             type: "toolCall",
-            id: sanitizeToolCallId(rawId, part.functionCall.name),
-            name: part.functionCall.name || "",
+            id: sanitizeToolCallId(rawId, rawName),
+            name: rawName,
             arguments: asToolCallArguments(part.functionCall.args),
             ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
           };
@@ -751,10 +873,61 @@ export async function streamResponse(
       }
 
       if (candidate?.finishReason) {
+        if (candidate.finishReason === "MALFORMED_FUNCTION_CALL") {
+          const recovered = tryRecoverMalformedFunctionCall(
+            candidate.finishMessage,
+            tools,
+            lastThoughtSignature,
+          );
+          if (recovered) {
+            finishCurrent();
+            blocks.push(recovered);
+            ensureStarted();
+            stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+            stream.push({
+              type: "toolcall_delta",
+              contentIndex: blockIndex(),
+              delta: JSON.stringify(recovered.arguments),
+              partial: output,
+            });
+            stream.push({
+              type: "toolcall_end",
+              contentIndex: blockIndex(),
+              toolCall: recovered,
+              partial: output,
+            });
+            hasContent = true;
+          } else if (candidate.finishMessage) {
+            finishCurrent();
+            const textContent = candidate.finishMessage.replace(
+              /^Malformed function call:\s*/i,
+              "",
+            );
+            const recoveredBlock: ActiveBlock = { type: "text", text: textContent };
+            blocks.push(recoveredBlock);
+            ensureStarted();
+            stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
+            stream.push({
+              type: "text_delta",
+              contentIndex: blockIndex(),
+              delta: textContent,
+              partial: output,
+            });
+            stream.push({
+              type: "text_end",
+              contentIndex: blockIndex(),
+              content: textContent,
+              partial: output,
+            });
+            hasContent = true;
+          }
+        }
+
         const stopReason = blocks.some((b) => b.type === "toolCall")
           ? StopReason.ToolUse
           : mapStopReason(candidate.finishReason);
         output.stopReason = stopReason;
+
         // Pi requires a concrete message on an error stop. Without one the UI can
         // only say "Unknown error", which is what hid the MALFORMED_FUNCTION_CALL
         // failures behind a tool-less request.
@@ -986,7 +1159,7 @@ export function createAntigravityStream(
 
             accountPool.markSuccessful(account);
             resetOutput(output);
-            received = await streamResponse(result.response, stream, output);
+            received = await streamResponse(result.response, stream, output, context.tools);
             successfulResponse = true;
             break;
           }
